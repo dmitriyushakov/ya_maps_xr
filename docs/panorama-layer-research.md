@@ -1,0 +1,289 @@
+# Слой панорам Яндекс.Карт: откуда данные и как получить их в ya-maps-xr
+
+Дата исследования: 2026-11-12.
+Что смотрел: `https://yandex.ru/maps/194/saratov/panorama/?ll=46.011922%2C51.541065&z=12`
+(DevTools → Network, плюс разбор клиентских JS-чанков и ручные запросы curl без
+кук/ключа), затем проверка на живых данных (Москва, Красная площадь, z17).
+
+---
+
+## 1. Коротко
+
+Слой панорам — это не один источник, а три уровня:
+
+| Что | Откуда |
+|---|---|
+| Доступность и зум-диапазон слоя | `yandex.ru/maps/api/layers/info` |
+| Геометрия покрытия + иконки панорам (клик-таргеты) | `core-stv-renderer.maps.yandex.net` (растровые PNG 2.x и векторные protobuf 3.x) |
+| Сама панорама: метаданные | `api-maps.yandex.ru/services/panoramas/1.x/` |
+| Сама панорама: картинка | `pano.maps.yandex.net/<imageId>/<level>.<x>.<y>` |
+
+Внутри карт это два слоя-источника данных:
+
+- **`stv`** — уличные панорамы (street view);
+- **`sta`** — «воздушные» панорамы (air), разреженные, во многих тайлах их нет.
+
+В коде клиента: `isStreetLayerAvailable` / `isAirLayerAvailable`,
+компоненты `panorama_layer` / `air`, клики — `layer:"stv"` и `layer:"sta"`.
+
+Страница `/maps/<region>/panorama/` — это просто карта с включённым слоем `stv`
+(`mode=panoramas`), отдельного «списка панорам» нет: точки приходят тайлами по зуму.
+
+---
+
+## 2. Метаданные слоя
+
+```
+https://yandex.ru/maps/api/layers/info?ajax=1&csrfToken=...&s=...&sessionId=...
+  &requests[0][center]=46.01192200,51.54106500
+  &requests[0][lang]=ru
+  &requests[0][layerIds][0]=stv
+  &requests[0][locale]=ru_RU
+  &requests[0][span]=0.48065186,0.16463331
+  &requests[0][zoom]=12
+  &requests[1][...layerIds][0]=sta...
+```
+
+Ответ:
+
+```json
+{"data":[{"stv":{"zoomRange":[2,21],"copyrights":[]}},
+         {"sta":{"zoomRange":[2,21],"copyrights":[]}}]}
+```
+
+То есть API сообщает только «слой есть, вот его зум-диапазон». Для стороннего
+клиента бесполезен: нужен `csrfToken` и `sessionId` (берутся из HTML/конфига
+карты). Зум-диапазон проще захардкодить (2..21).
+
+---
+
+## 3. Данные слоя — `core-stv-renderer`
+
+### 3.1 Растровые тайлы (простой путь)
+
+```
+https://0X.core-stv-renderer.maps.yandex.net/2.x/tiles
+  ?l=stv,sta&x=79233&y=41090&z=17&scale=1&lang=ru_RU&format=png&v=1
+```
+
+- `0X` = `01`..`04` (шардирование по хостам);
+- ответ: прозрачный PNG 256×256 RGBA, синие линии покрытия улиц + круглые иконки панорам;
+- `content-type: image/png`, `access-control-allow-origin: *`;
+- `l=stv` — только улицы, `l=sta` — только воздушные, `l=stv,sta` — оба (как в вебе);
+- `204 No Content` = в этом тайле покрытия нет (нормальная ситуация, особенно для `sta`);
+- зум 2..21; проверено на z8, z12, z14, z17, z18, z19 — тайлы есть.
+
+**Важно про параметр `v`:**
+
+- без `v` вообще → `400 <error><status>400</status><message>v parameter missing or mismatched</message></error>`;
+- значение **не проверяется**: `v=1`, `&v=` (пустой), `v=2025.01.01.00.00-1_25.01.01-0-1`
+  и настоящая строка `2026.11.12.03.34-1_26.11.10-0-31630` дают байт-в-байт
+  одинаковый ответ. Достаточно передавать любую непустую строку (проверено `v=1`).
+
+**Что не требуется:** `apikey`, куки, `client_id=yandex-web-maps`, `Referer`.
+Проверял `curl` без всего перечисленного — `200` и тот же PNG.
+
+### 3.2 Векторные тайлы (protobuf, если нужны id)
+
+```
+https://vec0X.core-stv-renderer.maps.yandex.net/3.x/tiles
+  ?l=sta,stv&x=2571&y=1364&z=12&lang=ru_RU&format=protobuf&v=1
+```
+
+`content-type: application/x-protobuf`. Разбор сырого protobuf (поля верхнего уровня):
+
+1. `varint` — версия формата (8);
+2. `bytes` — геометрия фич (сжатая, delta-кодирование; формат самодельный);
+3. `bytes` — битовая маска атрибутов;
+4. `bytes` — имена полей: `id`, `icon`, `preview`;
+5. `bytes` (повторяется) — значения: идентификаторы панорам вида
+
+```
+1348280768_715191969_23_1789638490
+1348202847_715237001_23_1783605525
+```
+
+Формат ID: `<внутренний id>_<...>_23_<unix-время съёмки>`.
+Последний сегмент — время съёмки (`1789638490` ≈ сентябрь 2026).
+`23` — тип/провайдер съёмки.
+
+Иконки по id догружаются отдельно:
+
+```
+https://vec04.core-stv-renderer.maps.yandex.net/3.x/icons?id=JXNQYR7K75IX&scale=4
+```
+
+В коде веб-клиента:
+
+```js
+if ("stv" === e) return {
+  tileUrl: stvTileRenderer + "tiles?l=sta,stv&x={{x}}&y={{y}}&z={{z}}&%l&v=%v&format=protobuf",
+  imageUrl: stvTileRenderer + "icons?id={{id}}&scale={{scale}}"
+}
+```
+
+Парсить protobuf ради хотспотов не рекомендую: геометрия в закрытом
+delta-формате, а для клика достаточно растрового слоя + `panoramas/1.x`
+(см. п. 5).
+
+### 3.3 Проекция тайлов — EPSG:3395, а не «сферический Меркатор»
+
+Тайлы `core-stv-renderer` (и тайлы карты `core-renderer-tiles`) считаются в
+**EPSG:3395** — эллипсоидальном Меркаторе WGS84. В приложении `scripts/geo.gd`
+используется сферическая формула (как в OSM/Leaflet).
+
+Разница в нормализованном `y` ≈ 0.0009, что на z17 — **~115 тайлов (~20 км)**.
+Если индексы тайлов считать по `Geo`, слой уедет очень далеко.
+
+Проверка: тайл `(79233, 41090, 17)`
+
+- `https://core-renderer-tiles.maps.yandex.ru/tiles?l=map&x=79233&y=41090&z=17&format=png`
+  → на картинке подписи «Красная площадь», «Лобное место», «Рубль»;
+- по сферической формуле для 55.7539, 37.6208 получается тайл **40974**, а не 41090;
+- по EPSG:3395 — ровно **41090**.
+
+Формула (проверена численно):
+
+```
+a = 6378137.0
+e = sqrt(1 - (6356752.3142 / a)^2) = 0.0818191908426
+
+y_m  = a * ln( tan(pi/4 + phi/2) * ((1 - e*sin(phi)) / (1 + e*sin(phi)))^(e/2) )
+py   = (1 - y_m / (a*pi)) / 2 * 256 * 2^zoom
+px   = (lon + 180) / 360 * 256 * 2^zoom
+```
+
+Внутри одного окна 650×450 разница масштабов двух проекций субпиксельная
+(~0.02%), поэтому для маркера/клика можно продолжать использовать `Geo`, но
+**индексы тайлов и их смещение считать по EPSG-y**.
+
+### 3.4 Проверка склейки оверлея
+
+Собрал тестовую композицию: окно Static API 650×450 (`ll=37.6208,55.7539&z=17`)
++ 9 тайлов `stv` (3×3), посчитанных по EPSG-y. Результат: синие линии покрытия
+и точки панорам легли точно по улицам (ГУМ, Мавзолей, Никольская, Красная
+площадь). То есть слой можно накладывать на нашу мозаику без ручной подгонки
+смещений.
+
+---
+
+## 4. Что происходит при открытии конкретной панорамы
+
+Клик/переход по точке вызывает:
+
+```
+https://api-maps.yandex.ru/services/panoramas/1.x/
+  ?l=stv&lang=ru_RU&ll=37.620800,55.753900&origin=userAction&provider=streetview
+```
+
+(соседние панорамы — `?oid=<panoramaId>&provider=streetview&l=stv&lang=ru_RU`)
+
+`apikey` сервис не проверяет (это уже используется в приложении,
+`scripts/panorama.gd`).
+
+Ответ — JSON, в котором есть:
+
+- `Data.panoramaId`, `Data.timestamp`, `Data.Point.coordinates`
+- `Data.EquirectangularProjection.Origin`
+- `Data.Images.imageId`, `Images.Zooms` (уровни 0..3: 5888×2944 → 512×256),
+  `Tiles` 256×256
+- `Data.View` (начальное направление/охват)
+- `Annotation.Thoroughfares` — переходы по улицам (href на соседние `oid`)
+- `Annotation.HistoricalPanoramas` — версии по годам (2010, 2013, 2015, 2023, 2025, 2026…)
+- `Annotation.Graph` — граф связанных панорам (Nodes/Edges) с lon/lat
+- `Annotation.Markers` (дома), `Annotation.Companies` (организации)
+- `Author`
+
+Картинка — JPEG 256×256:
+
+```
+https://pano.maps.yandex.net/GbwHmINO4i0U/3.0.0
+  → 200, image/jpeg, 256×256, access-control-allow-origin: *
+```
+
+Путь: `/<imageId>/<zoomLevel>.<tileX>.<tileY>`.
+
+---
+
+## 5. Как встроить в ya-maps-xr
+
+### 5.1 Проекция
+
+Добавить в `scripts/geo.gd` (~6 строк):
+
+```gdscript
+const A := 6378137.0
+const E := 0.0818191908426  # sqrt(1-(b/a)^2)
+
+static func yandex_world_px(lon: float, lat: float, zoom: int) -> Vector2:
+	var ph := deg_to_rad(clamp_lat(lat))
+	var y := A * log(tan(PI / 4.0 + ph / 2.0) * pow((1.0 - E * sin(ph)) / (1.0 + E * sin(ph)), E / 2.0))
+	var s := WORLD_TILE * pow(2.0, zoom)
+	return Vector2((lon + 180.0) / 360.0 * s, (1.0 - y / (A * PI)) / 2.0 * s)
+```
+
+### 5.2 Слой в планшете карты
+
+`scripts/map_tablet.gd` уже собирает мозаику 3×3 из Static API (`650×450` на
+ячейку, `TEX_W=1950`, `TEX_H=1350`). Слой панорам — второй такой же слой:
+
+1. По `yandex_world_px` вычислить видимое окно на текущем зуме;
+2. Взять тайлы `floor(px / 256)` с перекрытием — максимум 4×3 = 9–12 запросов;
+3. Каждый PNG (`Image.load_png_from_buffer`, RGBA) блитить в `Image` оверлея
+   со смещением `tile*256 - top_left`;
+4. `base.blend_rect(overlay, ...)` перед `ImageTexture.create_from_image` —
+   одна текстура, без лишних draw call;
+5. HTTP — через существующий `Net.get_bytes` и пул воркеров как у Static API;
+6. Кэш тайлов по `x/y/z` (LRU), иначе при каждом сдвиге карты летят лишние
+   запросы и приближается IP-троттлинг;
+7. Включать с `zoom >= 13` — на мелких зумах получается каша из линий и точек.
+
+### 5.3 Клик по панораме
+
+В PNG нет идентификаторов, поэтому:
+
+- клик по карте → `Pano.fetch_by_ll(lon, lat)` (уже есть,
+  `scripts/panorama.gd:57`, `origin=userAction`) — вернёт ближайшую панораму;
+- сервис вернёт панораму даже если она далеко → отбрасывать ответ, если
+  расстояние от точки клика до `Data.Point.coordinates` больше ~100–150 м.
+
+Альтернатива с точными id — векторные `3.x`-тайлы (п. 3.2), но нужен парсер
+закрытого формата геометрии.
+
+---
+
+## 6. Ограничения и риски
+
+- Это **внутренняя ручка веб-плеера**, а не публичный API. В Terms of Use её
+  нет; `l=stv` в Static API прямо запрещён («Layer 'stv' is not allowed for
+  rendering») — этот способ является обходом.
+- Сервис может измениться, переименоваться или заблокировать по IP/региону.
+- Сейчас `v` проверяется только на присутствие, поэтому версию отслеживать не
+  нужно (достаточно `v=1`). Если проверку ужесточат — придётся тянуть актуальную
+  строку из конфига веб-клиента.
+- Троттлинг по IP общий с сервисом панорам (`limited` в ответе), официальной
+  статистики по бесплатному ключу Яндекс не даёт.
+- Лишние 9–12 запросов на каждое движение карты: обязательны кэш и порог зума.
+
+---
+
+## 7. Команды для воспроизведения проверок
+
+```bash
+# растровый тайл (без ключа, без кук, без Referer)
+curl -s -o t.png -w "%{http_code} %{size_download}\n" \
+  "https://01.core-stv-renderer.maps.yandex.net/2.x/tiles?l=stv,sta&x=79233&y=41090&z=17&scale=1&lang=ru_RU&format=png&v=1"
+
+# без v — ошибка 400
+curl -s "https://01.core-stv-renderer.maps.yandex.net/2.x/tiles?l=stv,sta&x=79233&y=41090&z=17&format=png"
+
+# векторный тайл
+curl -s -o t.pb -w "%{http_code} %{size_download}\n" \
+  "https://vec01.core-stv-renderer.maps.yandex.net/3.x/tiles?l=sta,stv&x=79233&y=41090&z=17&format=protobuf&v=1"
+
+# метаданные панорамы по точке
+curl -s "https://api-maps.yandex.ru/services/panoramas/1.x/?l=stv&lang=ru_RU&ll=37.6208,55.7539&origin=userAction&provider=streetview" | head -c 400
+
+# тайл панорамы
+curl -s -o p.jpg -w "%{http_code} %{size_download}\n" "https://pano.maps.yandex.net/GbwHmINO4i0U/3.0.0"
+```

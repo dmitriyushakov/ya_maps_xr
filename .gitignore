@@ -1,0 +1,13 @@
+# Godot
+.godot/
+/android/
+/build/
+*.apk
+*.aab
+*.keystore
+
+dump/
+
+# OpenXR Vendors addon binaries (upstream release asset, ~50 MB).
+# Materialize with ./fetch_addon.sh after cloning.
+addons/godotopenxrvendors/.bin/
