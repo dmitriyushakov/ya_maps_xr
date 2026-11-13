@@ -24,6 +24,11 @@ var sphere: MeshInstance3D
 var material: ShaderMaterial
 var arrows: Node3D
 var streamer: Variant = null
+## Центр панорамы (точка съёмки) в мировых координатах. Сферу ставим туда, где
+## голова была в момент открытия панорамы: иначе глаз оказывается в стороне от
+## центра развёртки (в STAGE-пространстве — на высоте глаз над полом, т.е. ~1.6 м
+## выше центра) и картинка уезжает по вертикали на ~9°.
+var anchor := Vector3.ZERO
 var _priority_base := 0
 var _arrows_hidden := false
 var _yaw_deg := 0.0
@@ -65,6 +70,13 @@ func build(host: Node3D) -> void:
 	arrows = Node3D.new()
 	arrows.name = "Arrows"
 	root.add_child(arrows)
+
+
+## Центр панорамы (точка съёмки) — туда, где была голова при открытии.
+func set_anchor(pos: Vector3) -> void:
+	anchor = pos
+	if root != null and is_instance_valid(root):
+		root.position = pos
 
 
 func dispose() -> void:
@@ -201,7 +213,12 @@ func build_arrows(links: Array) -> void:
 		child.queue_free()
 	for link in links:
 		var yaw := float(link.get("yaw", 0.0))
-		var pos := Vector3(sin(yaw) * ARROW_RADIUS, ARROW_Y, -cos(yaw) * ARROW_RADIUS)
+		# Шевроны висят на фиксированной высоте ОТ ПОЛА, а не от центра сферы:
+		# центр теперь на голове (anchor, см. pano_view.set_anchor), и без этой
+		# поправки они уезжают вверх вместе с ним. Так их место не зависит ни от
+		# центра развёртки, ни от роста пользователя.
+		var y := ARROW_Y - anchor.y
+		var pos := Vector3(sin(yaw) * ARROW_RADIUS, y, -cos(yaw) * ARROW_RADIUS)
 		_add_marker(pos, yaw, Color(1, 1, 1), link)
 	_apply_arrows_fade(1.0)
 

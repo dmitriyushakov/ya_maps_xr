@@ -712,6 +712,7 @@ func _boot() -> void:
 		# чтобы не сидеть в темноте и можно было открыть планшет с поиском.
 		_view = PanoView.new()
 		_view.build(self)
+		_view.set_anchor(_pano_anchor_pos())
 		_view.set_priority(0)
 
 
@@ -850,6 +851,8 @@ func _apply_panorama(
 	_incoming.set_priority(10)     # поверх исходящего
 	_incoming.set_fade(1.0)        # сектора/стрелки видны как приехали
 	_incoming.set_backdrop_fade(0.0) # фон-заглушка не светится до загрузки
+	# Центр панорамы — под голову (см. PanoView.anchor).
+	_incoming.set_anchor(_pano_anchor_pos())
 	_view.set_priority(0)          # исходящий — нижний слой (база)
 	_view.hide_arrows()            # старые шевроны убираем сразу (новые — на входящей)
 
@@ -915,7 +918,7 @@ func _promote_incoming() -> void:
 		if t != null:
 			incoming.set_backdrop(t)
 	incoming.root.scale = Vector3.ONE
-	incoming.root.position = Vector3.ZERO
+	incoming.root.position = incoming.anchor
 	incoming.set_backdrop_fade(1.0)
 	incoming.set_fade(1.0)
 	incoming.set_priority(0)
@@ -935,6 +938,8 @@ func _start_first(pano: Dictionary, levels: Array, plan: Dictionary, token: int)
 		float(pano.get("lat_top", PI / 2.0)), float(pano.get("lat_span", PI))
 	)
 	_view.set_priority(0)
+	# Центр панорамы — под голову (см. PanoView.anchor).
+	_view.set_anchor(_pano_anchor_pos())
 
 	# Первая загрузка: быстрый мелкий уровень, затем основной фон. Если фон не
 	# приехал — не падаем: остаётся заглушка + сектора дотянут (без чёрного экрана).
@@ -1105,6 +1110,16 @@ func _prefetch_worker() -> void:
 	_prefetching = false
 
 
+# --- Центр панорамы ----------------------------------------------------------
+
+
+## Центр панорамы (точка съёмки) — где голова в момент открытия. Развёртка должна
+## быть вокруг глаз: reference space — STAGE (origin на полу), поэтому иначе глаз
+## оказывается в 1.6 м от центра развёртки и картинка уезжает по вертикали на ~9°.
+func _pano_anchor_pos() -> Vector3:
+	return xr_camera.global_position
+
+
 # --- Переход (сразу наезд, затем свап по готовности) -------------------------
 
 
@@ -1126,7 +1141,8 @@ func _play_transition(token: int) -> void:
 			var mt := _smooth(clampf(float(now - start) / 1000.0 / TRANSITION_MOVE_SEC, 0.0, 1.0))
 			var s := lerpf(1.0, TRANSITION_MOVE_SCALE, mt)
 			_view.root.scale = Vector3.ONE * s
-			_view.root.position = (1.0 - s) * _move_cam - _move_dir * (TRANSITION_MOVE_SHIFT * mt)
+			_view.root.position = _view.anchor + (1.0 - s) * (_move_cam - _view.anchor) \
+					- _move_dir * (TRANSITION_MOVE_SHIFT * mt)
 			if mt >= 1.0:
 				break
 
@@ -1178,7 +1194,7 @@ func _play_transition(token: int) -> void:
 			_incoming = null
 		if _view != null and is_instance_valid(_view.root):
 			_view.root.scale = Vector3.ONE
-			_view.root.position = Vector3.ZERO
+			_view.root.position = _view.anchor
 			_view.show_arrows()
 			_view.set_fade(1.0)
 			_view.set_priority(0)
@@ -1190,7 +1206,7 @@ func _play_transition(token: int) -> void:
 	_incoming = null
 	old.dispose()
 	_view.root.scale = Vector3.ONE
-	_view.root.position = Vector3.ZERO
+	_view.root.position = _view.anchor
 	_view.set_backdrop_fade(1.0)
 	_view.set_fade(1.0)
 	_view.set_priority(0)
@@ -1211,7 +1227,7 @@ func _cancel_transition() -> void:
 	_transitioning = false
 	if _view != null and is_instance_valid(_view.root):
 		_view.root.scale = Vector3.ONE
-		_view.root.position = Vector3.ZERO
+		_view.root.position = _view.anchor
 		_view.set_fade(1.0)
 		_view.set_priority(0)
 
